@@ -61,17 +61,63 @@ Granularity options: `60` (1m), `300` (5m), `900` (15m), `3600` (1h), `21600` (6
 
 ### `backtests/` — Technical Analysis
 
-BTC backtests and indicator scripts using Refinitiv Eikon data.
+BTC backtests and indicator scripts. Eikon-based scripts require a Refinitiv API key set via the `EIKON_APP_KEY` environment variable. CSV-based scripts use `btc_gbp_hourly.csv` (generate it with `cb_historical.py`).
 
-| File | Description |
-|---|---|
-| `test_btc.py` | BTC trend-following backtest |
-| `test_btc2.py` | Extended backtest with additional signals |
-| `test_btc_cta.py` | CTA-style momentum strategy |
-| `boll_bands.py` | Bollinger band analysis |
-| `cb_hist.py` | Technical indicators (MA, RSI, ATR, OBV, Bollinger Bands) on local CSV |
-| `BTC_ML.PY` | ML model comparison for BTC price |
-| `btc_gbp_hourly.csv` | Historical hourly BTC-GBP OHLCV data |
+#### `test_btc.py` — Golden Cross / RSI Dip Backtest (long only)
+
+Entry: golden cross (MA50 > MA200) or price dips >5% in 7 days with RSI < 40.
+Exit: +10% profit target, 2×ATR stop loss, or 14-bar time stop.
+
+Outputs a price chart with entry/exit markers and an equity curve subplot. Prints a full performance summary:
+
+```
+Total return:  +12.4%
+Closed trades: 8
+Win rate:      62.5%
+Avg win:       £18.32
+Avg loss:      £-9.10
+Max drawdown:  -4.1%
+Sharpe ratio:  1.43
+```
+
+#### `test_btc2.py` — Long/Short Volatility Backtest
+
+Bidirectional strategy using a 7/20 MA crossover and RSI-filtered dip/surge signals. Exposure limits prevent over-concentration. Same performance stats and equity curve output as `test_btc.py`.
+
+#### `test_btc_cta.py` — Multi-Timeframe MA Crossover Score
+
+Scores 39 MA pairs simultaneously (+1 bullish crossover, −1 bearish). Normalises the score and combines it with an RSI filter to identify high-consensus entry windows. Plots price with signals and the normalised score as a second panel.
+
+Configurable at the top of the file:
+```python
+LOOKBACK_DAYS        = 365
+SCORE_BUY_THRESHOLD  =  0.05
+SCORE_SELL_THRESHOLD = -0.05
+```
+
+Data source: `btc_gbp_hourly.csv`
+
+#### `boll_bands.py` — Bollinger Band + MACD + RSI Signal Chart
+
+4-panel chart: price with Bollinger Bands and MA50/200, MACD line, MACD histogram (green/red), RSI with overbought/oversold fill zones. Buy signals trigger on BB lower band touch or RSI < 30 with MACD confirmation.
+
+Data source: Eikon
+
+#### `cb_hist.py` — Technical Indicator Dashboard
+
+5-panel dashboard from local CSV: price + MAs + Bollinger Bands, RSI with fill zones, ATR, rolling std dev, volume with spike highlighting and OBV on a twin axis.
+
+```python
+LOOKBACK_DAYS = 60  # configurable at top of file
+```
+
+Data source: `btc_gbp_hourly.csv`
+
+#### `BTC_ML.PY` — ML Classifier
+
+Predicts whether BTC will be ≥1% higher in 8 hours. Compares Logistic Regression, Random Forest, Gradient Boosting, and XGBoost via TimeSeriesSplit cross-validation with SMOTE resampling. Selects the best model by F1 score and runs a SHAP feature importance analysis.
+
+Data source: `btc_gbp_hourly.csv`
 
 ---
 
@@ -79,11 +125,30 @@ BTC backtests and indicator scripts using Refinitiv Eikon data.
 
 **Install dependencies:**
 ```bash
+# Core tools
 pip install coinbase-advanced-py pandas requests reportlab
+
+# Backtests
+pip install eikon matplotlib numpy
+
+# ML backtest only
+pip install scikit-learn xgboost imbalanced-learn shap seaborn
 ```
 
-**API key:**
+**Coinbase API key:**
 
-Download your CDP API key from [Coinbase Developer Platform](https://developer.coinbase.com) and save it as `cdp_api_key.json` in this folder. This file is excluded from git.
+Download your CDP API key from [Coinbase Developer Platform](https://developer.coinbase.com) and save it as `cdp_api_key.json` in the root of this repo. This file is excluded from git.
 
-The `cb_historical.py` script uses Coinbase's public REST API and does not require a key.
+**Eikon API key:**
+
+Set your Refinitiv Eikon key as an environment variable before running any Eikon-based backtest:
+```bash
+export EIKON_APP_KEY="your_key_here"
+```
+
+**Historical data (for CSV-based scripts):**
+
+```bash
+python3 cb_historical.py --pair BTC-GBP --granularity 3600
+# saves btc_gbp_1h_....csv — rename to backtests/btc_gbp_hourly.csv
+```
