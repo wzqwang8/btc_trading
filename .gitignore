@@ -1,0 +1,19 @@
+# API credentials — never commit
+cdp_api_key.json
+*.json
+
+# Generated outputs — recreated on each run
+all_fills.csv
+*_uk_tax_report.csv
+crypto_tax_report.pdf
+SA108_*.pdf
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# macOS
+.DS_Store
