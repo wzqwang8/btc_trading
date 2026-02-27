@@ -1,162 +1,217 @@
+"""
+BTC Backtest — Golden Cross + RSI Dip Strategy (Long Only)
+===========================================================
+Entry signals:
+  - Golden Cross: 50-day MA crosses above 200-day MA
+  - RSI Dip:      price drops >5% in 7 days AND RSI < 40
+
+Exit signals (per trade):
+  - Profit target: +10%
+  - Stop loss:     price - 2x ATR
+  - Time stop:     14 bars (forced close)
+
+Data source: Refinitiv Eikon (BTC=)
+"""
+
+import os
+import numpy as np
 import pandas as pd
 import eikon as ek
-import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
-import time
 
-# Set up Eikon API
-ek.set_app_key('1e01b72982374e88971ea95fe42801910d7207ef')
+# ── Config ────────────────────────────────────────────────────────────────────
+EIKON_APP_KEY       = os.environ.get("EIKON_APP_KEY", "YOUR_KEY_HERE")
+START               = "2024-01-01"
+END                 = datetime.today().strftime("%Y-%m-%d")
+STARTING_CAPITAL    = 100_000
+TRADE_SIZE          = 100       # GBP per trade
+FEE                 = 0.005     # 0.5% per side
+PROFIT_TARGET_PCT   = 0.10      # 10% profit target
+ATR_STOP_MULT       = 2.0       # stop = entry - N * ATR
+TIME_STOP_BARS      = 14        # force close after N bars
 
-# Define date range
-start = '2024-01-01'
-end = '2025-05-21'
+# ── Data ──────────────────────────────────────────────────────────────────────
+ek.set_app_key(EIKON_APP_KEY)
+btc = ek.get_timeseries("BTC=", start_date=START, end_date=END)
 
-# Input
-btc = ek.get_timeseries('BTC=', start_date=start, end_date=end)
-btc['50'] = btc['CLOSE'].rolling(window=50).mean()
-btc['200'] = btc['CLOSE'].rolling(window=200).mean()
+# Indicators
+btc["MA50"]  = btc["CLOSE"].rolling(50).mean()
+btc["MA200"] = btc["CLOSE"].rolling(200).mean()
+btc["std"]   = btc["CLOSE"].rolling(14).std()
+
+delta      = btc["CLOSE"].diff()
+gain       = delta.where(delta > 0, 0).rolling(14).mean()
+loss_r     = (-delta.where(delta < 0, 0)).rolling(14).mean()
+btc["RSI"] = 100 - (100 / (1 + gain / loss_r))
+
+prev_close = btc["CLOSE"].shift(1).bfill()
+btc["TR"]  = pd.concat([
+    btc["HIGH"] - btc["LOW"],
+    (btc["HIGH"] - prev_close).abs(),
+    (btc["LOW"]  - prev_close).abs(),
+], axis=1).max(axis=1)
+btc["ATR"] = btc["TR"].rolling(14).mean()
+
 btc.dropna(inplace=True)
-btc['Prev_Close'] = btc['CLOSE'].shift(1)
-btc.iloc[0, btc.columns.get_loc('Prev_Close')] = btc.iloc[1, btc.columns.get_loc('Prev_Close')]
-btc['std'] = btc['CLOSE'].rolling(window=14).std()
+print(btc.tail())
 
-# Calculate RSI (14-day by default)
-delta = btc['CLOSE'].diff()  # Difference between consecutive prices
-gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()  # Average gains
-loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()  # Average losses
-rs = gain / loss  # Relative strength
-btc['RSI'] = 100 - (100 / (1 + rs))  # RSI Calculation
+# ── Backtest ──────────────────────────────────────────────────────────────────
+cash          = STARTING_CAPITAL
+active_trades = []
+trade_log     = []
+equity_curve  = []
 
-# Calculate True Range (TR)
-btc['TR'] = btc[['HIGH', 'LOW', 'Prev_Close']].apply(
-    lambda row: max(
-        row['HIGH'] - row['LOW'], 
-        abs(row['HIGH'] - row['Prev_Close']), 
-        abs(row['LOW'] - row['Prev_Close'])
-    ),
-    axis=1
-)
-btc['ATR'] = btc['TR'].rolling(window=14).mean()
-btc.dropna(inplace=True)
-
-print(btc)
-
-# Initialize variables for backtesting
-btc['Position'] = 0  # 1 for Buy, -1 for Sell, 0 for No Position
-cash = 1000000  # Total cash (not fully used for each trade)
-allocated_cash_per_trade = 100  # Fixed amount per trade
-active_trades = []  # List to store active trades
-trade_log = []
-
-# Iterate through the btc to simulate trades
 for i in range(len(btc)):
-    # Check for a buy signal (Golden Cross) or another buy condition
-    if (btc['50'].iloc[i-1] < btc['200'].iloc[i-1] and btc['50'].iloc[i] > btc['200'].iloc[i] or
-        btc['CLOSE'].iloc[i] < btc['CLOSE'].iloc[i-7]*0.95 and btc['RSI'].iloc[i] < 40) and cash >= allocated_cash_per_trade:
-        
-        # Calculate buy price, stop loss, and profit target for new trade
-        buy_price = btc['CLOSE'].iloc[i] * 1.005  # Account for 0.5% fee
-        stop_loss = buy_price - (2 * btc['ATR'].iloc[i])  # ATR-based stop loss
-        profit_target = buy_price * 1.1  # ATR-based profit target
-        
-        # Update cash and add the new trade
-        cash -= allocated_cash_per_trade  # Subtract cash for this trade
+    price   = btc["CLOSE"].iloc[i]
+    ma50    = btc["MA50"].iloc[i]
+    ma200   = btc["MA200"].iloc[i]
+    rsi     = btc["RSI"].iloc[i]
+    atr     = btc["ATR"].iloc[i]
+    p7      = btc["CLOSE"].iloc[i - 7] if i >= 7 else price
+
+    # ── Entry signal ──────────────────────────────────────────────────────────
+    golden_cross = (
+        btc["MA50"].iloc[i - 1] < btc["MA200"].iloc[i - 1]
+        and ma50 > ma200
+    )
+    rsi_dip = (price < p7 * 0.95) and (rsi < 40)
+
+    if (golden_cross or rsi_dip) and cash >= TRADE_SIZE:
+        entry  = price * (1 + FEE)
+        stop   = entry - ATR_STOP_MULT * atr
+        target = entry * (1 + PROFIT_TARGET_PCT)
+        cash  -= TRADE_SIZE
         active_trades.append({
-            'buy_price': buy_price,
-            'stop_loss': stop_loss,
-            'profit_target': profit_target,
-            'buy_index': i,
-            'action': 'Buy'
+            "entry":  entry,
+            "stop":   stop,
+            "target": target,
+            "bar":    i,
         })
-        
-        btc.at[btc.index[i], 'Position'] = 1  # Mark position as active
-        trade_log.append({'Date': btc.index[i].strftime('%d-%m-%y'), 'Action': 'Buy', 'Price': round(float(buy_price))})
-    
-    # Iterate over all active trades to check for profit-taking or stop loss conditions
+        trade_log.append({"Date": btc.index[i], "Action": "Buy", "Price": entry})
+
+    # ── Exit checks ───────────────────────────────────────────────────────────
     for trade in active_trades[:]:
-        # Check if 2 weeks have passed since the buy (14 days)
-        if i - trade['buy_index'] >= 14:
-            sell_price = btc['CLOSE'].iloc[i] * 0.995  # Account for 0.5% fee
-            loss = (sell_price - trade['buy_price']) * (allocated_cash_per_trade / trade['buy_price'])
-            cash += loss  # Update cash with loss
-            active_trades.remove(trade)  # Remove trade from active trades
-            btc.at[btc.index[i], 'Position'] = -1  # Mark position as closed
-            trade_log.append({'Date': btc.index[i].strftime('%d-%m-%y'), 'Action': 'Forced Close (2 Weeks)', 'Price': round(float(sell_price)), 'Loss': round(float(loss))})
-        
-        # Check for profit target
-        elif btc['CLOSE'].iloc[i] >= trade['profit_target']:  # If profit target is hit
-            sell_price = btc['CLOSE'].iloc[i] * 0.995  # Account for 0.5% fee
-            profit = (sell_price - trade['buy_price']) * (allocated_cash_per_trade / trade['buy_price'])
-            cash += profit  # Update cash with profit
-            active_trades.remove(trade)  # Remove trade from active trades
-            btc.at[btc.index[i], 'Position'] = -1  # Mark position as closed
-            trade_log.append({'Date': btc.index[i].strftime('%d-%m-%y'), 'Action': 'Profit Target', 'Price': round(float(sell_price)), 'Profit': round(float(profit))})
-        
-        # Check for stop loss
-        elif btc['CLOSE'].iloc[i] <= trade['stop_loss']:  # If stop loss is hit
-            sell_price = btc['CLOSE'].iloc[i] * 0.995  # Account for 0.5% fee
-            loss = (sell_price - trade['buy_price']) * (allocated_cash_per_trade / trade['buy_price'])
-            cash += loss  # Update cash with loss
-            active_trades.remove(trade)  # Remove trade from active trades
-            btc.at[btc.index[i], 'Position'] = -1  # Mark position as closed
-            trade_log.append({'Date': btc.index[i].strftime('%d-%m-%y'), 'Action': 'Stop Loss', 'Price': round(float(sell_price)), 'Loss': round(float(loss))})
+        exit_price = None
+        reason     = None
 
-# Summarize results
-total_profit = sum(trade['Profit'] for trade in trade_log if 'Profit' in trade)  # Sum of all profits
-total_loss = sum(trade['Loss'] for trade in trade_log if 'Loss' in trade)  # Sum of all losses
-net_profit = total_profit + total_loss  # Combine profits and losses
-num_trades = len([trade for trade in trade_log if trade['Action'] == 'Profit Target' or trade['Action'] == 'Stop Loss' or trade['Action'] == 'Forced Close (2 Weeks)'])
+        if i - trade["bar"] >= TIME_STOP_BARS:
+            exit_price = price * (1 - FEE)
+            reason     = "Time Stop"
+        elif price >= trade["target"]:
+            exit_price = price * (1 - FEE)
+            reason     = "Profit Target"
+        elif price <= trade["stop"]:
+            exit_price = price * (1 - FEE)
+            reason     = "Stop Loss"
 
-print(f"Total Profit: ${total_profit:.2f}")
-print(f"Total Loss: ${total_loss:.2f}")
-print(f"Net Profit: ${net_profit:.2f}")
-print(f"Number of Trades: {num_trades}")
-print("Trade Log:")
-for trade in trade_log:
-    print(trade)
+        if exit_price is not None:
+            units = TRADE_SIZE / trade["entry"]
+            pnl   = (exit_price - trade["entry"]) * units
+            cash += TRADE_SIZE + pnl
+            active_trades.remove(trade)
+            trade_log.append({
+                "Date":   btc.index[i],
+                "Action": reason,
+                "Price":  exit_price,
+                "PnL":    pnl,
+            })
 
-# Initialize variable to keep track of trade numbers
-trade_number = 1
+    # Track equity (cash + mark-to-market of open trades)
+    unrealised = sum(
+        (price - t["entry"]) * (TRADE_SIZE / t["entry"])
+        for t in active_trades
+    )
+    equity_curve.append(cash + unrealised)
 
-# Visualize the trades on the chart
-plt.figure(figsize=[14, 7])
-plt.plot(btc['CLOSE'].index, btc['CLOSE'], label='BTC', color='blue')
-plt.plot(btc['50'].index, btc['50'], label='50-Day Moving Average', color='orange')
-plt.plot(btc['200'].index, btc['200'], label='200-Day Moving Average', color='green')
+# ── Performance stats ─────────────────────────────────────────────────────────
+closed = [t for t in trade_log if "PnL" in t]
+pnls   = [t["PnL"] for t in closed]
 
-# Highlight buy and sell points
-buy_signals = btc[btc['Position'] == 1]
-sell_signals = btc[btc['Position'] == -1]
+total_pnl    = sum(pnls)
+wins         = [p for p in pnls if p > 0]
+losses       = [p for p in pnls if p <= 0]
+win_rate     = len(wins) / len(pnls) * 100 if pnls else 0
+avg_win      = np.mean(wins)  if wins   else 0
+avg_loss     = np.mean(losses) if losses else 0
 
-# Create lists to store labels for buy and sell points
-buy_labels = []
-sell_labels = []
-rsi_values = []  # To store RSI values for the legend
+equity = pd.Series(equity_curve, index=btc.index)
+peak   = equity.cummax()
+dd     = (equity - peak) / peak * 100
+max_dd = dd.min()
 
-# Iterate over buy signals and match them with the corresponding sell signal
-for buy_index, buy_row in buy_signals.iterrows():
-    sell_index = None
-    for sell_index, sell_row in sell_signals.iterrows():
-        if sell_index > buy_index:  # Match sell after buy
-            buy_labels.append(f'Buy {trade_number}')
-            sell_labels.append(f'Sell {trade_number}')
-            rsi_values.append(buy_row["RSI"])  # Store RSI for the legend
-            trade_number += 1
-            break
+returns = equity.pct_change().dropna()
+sharpe  = (returns.mean() / returns.std() * np.sqrt(252)) if returns.std() > 0 else 0
+total_return = (equity.iloc[-1] / STARTING_CAPITAL - 1) * 100
 
-# Plot Buy and Sell Points
-plt.scatter(buy_signals.index, buy_signals['CLOSE'], label='Buy Signal', marker='^', color='green', s=100)
-plt.scatter(sell_signals.index, sell_signals['CLOSE'], label='Sell/Stop Loss Signal', marker='v', color='red', s=100)
+print("\n" + "=" * 50)
+print("BACKTEST RESULTS")
+print("=" * 50)
+print(f"Period:          {START} → {END}")
+print(f"Starting capital: £{STARTING_CAPITAL:,.0f}")
+print(f"Final equity:     £{equity.iloc[-1]:,.0f}")
+print(f"Total return:     {total_return:+.1f}%")
+print(f"Total P&L:        £{total_pnl:+,.2f}")
+print(f"Closed trades:    {len(closed)}")
+print(f"Win rate:         {win_rate:.1f}%")
+print(f"Avg win:          £{avg_win:+,.2f}")
+print(f"Avg loss:         £{avg_loss:+,.2f}")
+print(f"Max drawdown:     {max_dd:.1f}%")
+print(f"Sharpe ratio:     {sharpe:.2f}")
+print("=" * 50)
 
-# Add legend for RSI values
-for i, rsi_value in enumerate(rsi_values):
-    plt.plot([], [], 'o', label=f'RSI Buy {i+1}: {round(rsi_value, 2)}', color='green')
+# ── Chart ─────────────────────────────────────────────────────────────────────
+buys  = [t for t in trade_log if t["Action"] == "Buy"]
+exits = [t for t in trade_log if "PnL" in t]
 
-# Final chart formatting
-plt.title('BTC with Backtest - 50-Day and 200-Day Moving Averages (With Stop Loss)')
-plt.xlabel('Date')
-plt.ylabel('Price $')
-plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
-plt.grid(True)
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), sharex=False,
+                                gridspec_kw={"height_ratios": [2, 1]})
+
+# Price + signals
+ax1.plot(btc.index, btc["CLOSE"],  label="BTC", color="black", linewidth=1)
+ax1.plot(btc.index, btc["MA50"],   label="MA50",  color="blue",   linewidth=1)
+ax1.plot(btc.index, btc["MA200"],  label="MA200", color="orange", linewidth=1)
+ax1.scatter([t["Date"] for t in buys],
+            [t["Price"] for t in buys],
+            marker="^", color="green", s=100, label="Buy", zorder=5)
+ax1.scatter([t["Date"] for t in exits],
+            [t["Price"] for t in exits],
+            marker="v", color="red", s=80, label="Exit", zorder=5)
+ax1.set_title(f"BTC Golden Cross / RSI Dip Backtest  |  Win rate {win_rate:.0f}%  |  Sharpe {sharpe:.2f}")
+ax1.set_ylabel("Price (£)")
+ax1.legend(loc="upper left")
+ax1.grid(True, alpha=0.3)
+
+# Equity curve
+ax2.plot(btc.index, equity_curve, color="steelblue", linewidth=1.5, label="Equity")
+ax2.fill_between(btc.index, STARTING_CAPITAL, equity_curve,
+                 where=[e >= STARTING_CAPITAL for e in equity_curve],
+                 color="green", alpha=0.15)
+ax2.fill_between(btc.index, STARTING_CAPITAL, equity_curve,
+                 where=[e < STARTING_CAPITAL for e in equity_curve],
+                 color="red", alpha=0.15)
+ax2.axhline(STARTING_CAPITAL, color="gray", linestyle="--", linewidth=0.8)
+ax2.set_title(f"Equity Curve  |  Max drawdown {max_dd:.1f}%  |  Return {total_return:+.1f}%")
+ax2.set_ylabel("Equity (£)")
+ax2.set_xlabel("Date")
+ax2.legend(loc="upper left")
+ax2.grid(True, alpha=0.3)
+
+plt.tight_layout()
 plt.show()
+
+# Trade table
+if closed:
+    rows = [[t["Date"].strftime("%d-%m-%y"), t["Action"], f"£{t['Price']:,.0f}", f"£{t['PnL']:+,.2f}"]
+            for t in closed]
+    fig2, ax = plt.subplots(figsize=(10, max(3, len(rows) * 0.35 + 1)))
+    ax.axis("off")
+    tbl = ax.table(cellText=rows,
+                   colLabels=["Date", "Exit Reason", "Price", "P&L"],
+                   loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(8)
+    tbl.auto_set_column_width([0, 1, 2, 3])
+    fig2.suptitle(f"Trade Log  —  Net P&L £{total_pnl:+,.2f}", fontsize=11)
+    plt.tight_layout()
+    plt.show()
