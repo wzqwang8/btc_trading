@@ -13,7 +13,7 @@ Fetches your full Coinbase trade history and produces a tax report using HMRC's 
 3. Section 104 pool (average cost)
 
 **Outputs:**
-- `crypto_tax_report.pdf` — full multi-asset report (like Koinly)
+- `crypto_tax_report.pdf` — full multi-asset report 
 - `SA108_YYYY-YY.pdf` — one per tax year, ready for HMRC Self Assessment
 - `{pair}_uk_tax_report.csv` — per-asset disposal log
 
@@ -152,3 +152,4 @@ export EIKON_APP_KEY="your_key_here"
 python3 cb_historical.py --pair BTC-GBP --granularity 3600
 # saves btc_gbp_1h_....csv — rename to backtests/btc_gbp_hourly.csv
 ```
+
